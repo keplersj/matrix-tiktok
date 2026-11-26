@@ -95,6 +95,25 @@ func (c *Client) DownloadSticker(ctx context.Context, stickerURL string) ([]byte
 	return resp.Body(), normalizeContentType(resp.Header().Get("Content-Type"), guessStickerMIMEFromURL(stickerURL)), nil
 }
 
+// DownloadSharedPostCover fetches the cover image of a post shared into a DM
+// (SharedPost.CoverURL). Like sticker assets, cover URLs are pre-signed CDN
+// links, so no TikTok session cookies are needed.
+func (c *Client) DownloadSharedPostCover(ctx context.Context, coverURL string) ([]byte, string, error) {
+	resp, err := newScraperClient().R().
+		SetContext(ctx).
+		SetHeader("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8").
+		SetHeader("Referer", "https://www.tiktok.com/").
+		Get(coverURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("download shared post cover %s: %w", coverURL, err)
+	}
+	if resp.IsError() {
+		return nil, "", fmt.Errorf("shared post cover URL %s returned HTTP %d", coverURL, resp.StatusCode())
+	}
+	body := resp.Body()
+	return body, normalizeContentType(resp.Header().Get("Content-Type"), detectImageMIME(body)), nil
+}
+
 // DownloadPrivateImage fetches an authenticated private-image CDN URL using the
 // logged-in TikTok browser session, decrypts the returned blob with AES-256-GCM,
 // and returns the plaintext image bytes plus a detected image MIME type.
