@@ -35,7 +35,7 @@ type Message struct {
 	ConvID          string
 	ClientMessageID string
 	SenderID        string
-	Type            string // "text", "image", "video", "sticker"
+	Type            string // "text", "image", "video", "shared_post", "sticker"
 	MessageSubtype  string
 	Text            string
 	MediaURL        string
@@ -64,6 +64,9 @@ type Message struct {
 	CursorTsUs uint64
 	// RawContentJSON is the original field-8 JSON body bytes (for round-tripping refmsg content on send).
 	RawContentJSON []byte
+	// SharedPost carries the card fields (author, caption, cover) of a shared
+	// TikTok video or photo post. It is nil for every other message type.
+	SharedPost *SharedPost
 }
 
 // Reaction represents a single emoji reaction on a message and the users who sent it.
@@ -136,7 +139,9 @@ func deduplicateReactions(in []Reaction) []Reaction {
 //
 //	0, 700 → "text"  (REST API uses 0; WebSocket push uses 700)
 //	703    → "text"  (reply; same text field; parent id is protobuf message_reply, field 1)
-//	800    → "video" (shared TikTok post)
+//	800    → "video"       (shared TikTok video)
+//	810    → "shared_post" (shared TikTok photo-mode post; no playable video)
+//	502    → "sticker"     (GIF chosen from the keyboard's GIF search)
 func parseMessageContent(ctx context.Context, c *Client, contentBytes []byte) (msgType, text, mediaURL, mimeType string) {
 	if len(contentBytes) == 0 {
 		return
@@ -172,17 +177,26 @@ func parseMessageContent(ctx context.Context, c *Client, contentBytes []byte) (m
 		if value, ok := content["text"].(string); ok {
 			text = value
 		}
-	case 800:
+	case aweTypeSharedVideo, aweTypeSharedPhotoPost:
 		msgType = "video"
-		if itemID, ok := content["itemId"].(string); ok && itemID != "" {
-			if uid, ok := content["uid"].(string); ok && uid != "" {
-				if user, err := c.GetUser(ctx, uid); err == nil && user.UniqueID != "" {
-					mediaURL = "https://www.tiktok.com/@" + user.UniqueID + "/video/" + itemID
-				}
-			}
+		if int(aweTypeF) == aweTypeSharedPhotoPost {
+			msgType = "shared_post"
 		}
-		if value, ok := content["content_title"].(string); ok {
-			text = value
+		if post := parseSharedPostFromContentJSON(content); post != nil {
+			mediaURL = sharedPostURL(lookupUniqueID(ctx, c, post.AuthorUID), post.ItemID)
+			text = post.Caption
+		}
+	case aweTypeGIFSticker:
+		if gifURL, gifText, ok := parseGIFStickerFromContentJSON(content); ok {
+			msgType = "sticker"
+			mediaURL = gifURL
+			mimeType = guessStickerMIMEFromURL(gifURL)
+			text = "[sticker]"
+			if gifText != "" {
+				text = "[" + gifText + "]"
+			}
+		} else {
+			msgType = fmt.Sprintf("type_%d", int(aweTypeF))
 		}
 	default:
 		msgType = fmt.Sprintf("type_%d", int(aweTypeF))
@@ -195,6 +209,32 @@ func parseMessageContent(ctx context.Context, c *Client, contentBytes []byte) (m
 			Msg("Received TikTok message with unrecognised aweType — please open an issue")
 	}
 	return
+}
+
+// sharedPostForType returns the shared-post card fields when the parsed
+// message is a shared video or photo post, and nil otherwise (for example when
+// the row turned out to be a private video or a sticker).
+func sharedPostForType(msgType string, contentJSON []byte) *SharedPost {
+	if msgType != "video" && msgType != "shared_post" {
+		return nil
+	}
+	return parseSharedPostFromContentBytes(contentJSON)
+}
+
+// lookupUniqueID resolves a TikTok user id to its @username for building post
+// links. It returns "" when no client is available or the lookup fails; the
+// caller then falls back to a link without the username.
+func lookupUniqueID(ctx context.Context, c *Client, uid string) string {
+	if c == nil || uid == "" {
+		return ""
+	}
+	user, err := c.GetUser(ctx, uid)
+	if err != nil {
+		zerolog.Ctx(ctx).Debug().Err(err).Str("user_id", uid).
+			Msg("Failed to look up shared post author; linking without username")
+		return ""
+	}
+	return user.UniqueID
 }
 
 // parseReplyQuotedTextFromWire extracts the inner chat "text" from TikTok's message_reply
@@ -603,6 +643,7 @@ func parseMessageEntry(ctx context.Context, c *Client, entry *tiktokpb.Conversat
 		SenderSecUID:    entry.GetSenderSecUid(),
 		CursorTsUs:      entry.GetCursorTsUs(),
 		RawContentJSON:  rawJSON,
+		SharedPost:      sharedPostForType(msgType, contentJSON),
 	}, cursorTs, nil
 }
 

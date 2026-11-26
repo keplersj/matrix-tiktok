@@ -573,6 +573,7 @@ func (c *Client) parseChatEvent(ctx context.Context, env *tiktokpb.WebsocketEnve
 		SenderSecUID:    detail.GetSenderSecUid(),
 		CursorTsUs:      detail.GetCursorTsUs(),
 		RawContentJSON:  rawJSON,
+		SharedPost:      sharedPostForType(msgType, wsContent),
 	}
 	conv := Conversation{
 		ID:           convID,
