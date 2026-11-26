@@ -52,6 +52,8 @@ func (tc *TikTokClient) convertMessage(
 		return tc.convertStickerMessage(ctx, portal, intent, msg)
 	case "video":
 		return tc.convertVideoMessage(ctx, portal, intent, msg)
+	case "shared_post":
+		return tc.convertSharedPostMessage(ctx, portal, intent, msg)
 	default:
 		// Any other unsupported type falls back to a
 		// notice so the user knows something arrived even if we can't render it.
@@ -341,6 +343,11 @@ func (tc *TikTokClient) convertVideoMessage(
 		data, mime, err = tc.apiClient.DownloadVideo(ctx, msg.MediaURL)
 	}
 	if err != nil {
+		if msg.SharedPost != nil {
+			log.Debug().Err(err).Str("url", msg.MediaURL).
+				Msg("Failed to download shared TikTok video; sending its cover card instead")
+			return tc.convertSharedPostMessage(ctx, portal, intent, msg)
+		}
 		log.Warn().Err(err).Str("url", msg.MediaURL).
 			Msg("Failed to download TikTok video; falling back to text")
 		return convertVideoFallback(msg), nil
@@ -403,6 +410,78 @@ func (tc *TikTokClient) convertVideoMessage(
 				Type:       event.EventMessage,
 				Content:    content,
 				DBMetadata: vmeta,
+			},
+		},
+	}, nil
+}
+
+// convertSharedPostMessage renders a TikTok post shared into a DM the way
+// TikTok's own client does: the post's cover image with the author, caption and
+// a link to the post as the image caption. It is used for photo-mode posts
+// (which have no video to download) and for shared videos whose download
+// failed. Without a downloadable cover it falls back to the same text card.
+func (tc *TikTokClient) convertSharedPostMessage(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	intent bridgev2.MatrixAPI,
+	msg libtiktok.Message,
+) (*bridgev2.ConvertedMessage, error) {
+	post := msg.SharedPost
+	if post == nil || post.CoverURL == "" || tc.apiClient == nil || intent == nil || portal == nil {
+		return convertVideoFallback(msg), nil
+	}
+	log := zerolog.Ctx(ctx)
+
+	data, mime, err := tc.apiClient.DownloadSharedPostCover(ctx, post.CoverURL)
+	if err != nil {
+		log.Warn().Err(err).Str("item_id", post.ItemID).
+			Msg("Failed to download shared TikTok post cover; falling back to text")
+		return convertVideoFallback(msg), nil
+	}
+
+	fileName := imageFileName(mime)
+	size := int64(len(data))
+	content := &event.MessageEventContent{
+		MsgType: event.MsgImage,
+		Body:    fileName,
+		Info: &event.FileInfo{
+			MimeType: mime,
+			Size:     int(size),
+			Width:    post.CoverWidth,
+			Height:   post.CoverHeight,
+		},
+	}
+
+	mxcURL, encFile, err := intent.UploadMediaStream(
+		ctx,
+		portal.MXID,
+		size,
+		false,
+		func(dest io.Writer) (*bridgev2.FileStreamResult, error) {
+			if _, err := dest.Write(data); err != nil {
+				return nil, err
+			}
+			return &bridgev2.FileStreamResult{
+				FileName: fileName,
+				MimeType: mime,
+			}, nil
+		},
+	)
+	if err != nil {
+		log.Warn().Err(err).Str("item_id", post.ItemID).
+			Msg("Failed to upload shared TikTok post cover; falling back to text")
+		return convertVideoFallback(msg), nil
+	}
+	content.URL = mxcURL
+	content.File = encFile
+	applyTikTokVideoCaption(content, msg)
+
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{
+			{
+				Type:       event.EventMessage,
+				Content:    content,
+				DBMetadata: messageMetaFromLib(msg),
 			},
 		},
 	}, nil
@@ -497,6 +576,9 @@ func applyTikTokVideoCaption(content *event.MessageEventContent, msg libtiktok.M
 }
 
 func tiktokVideoCaptionBody(msg libtiktok.Message) string {
+	if msg.SharedPost != nil {
+		return sharedPostCaptionBody(msg)
+	}
 	text := strings.TrimSpace(msg.Text)
 	mediaURL := strings.TrimSpace(msg.MediaURL)
 	switch {
@@ -510,6 +592,9 @@ func tiktokVideoCaptionBody(msg libtiktok.Message) string {
 }
 
 func tiktokVideoCaptionHTML(msg libtiktok.Message) string {
+	if msg.SharedPost != nil {
+		return sharedPostCaptionHTML(msg)
+	}
 	text := strings.TrimSpace(msg.Text)
 	mediaURL := strings.TrimSpace(msg.MediaURL)
 	switch {
@@ -522,6 +607,48 @@ func tiktokVideoCaptionHTML(msg libtiktok.Message) string {
 	default:
 		return ""
 	}
+}
+
+// sharedPostCaptionBody formats a shared post as a short plain-text card:
+//
+//	Kay on TikTok
+//	<caption>
+//	https://www.tiktok.com/@/video/<id>
+func sharedPostCaptionBody(msg libtiktok.Message) string {
+	post := msg.SharedPost
+	lines := []string{sharedPostHeading(post)}
+	if post.Caption != "" {
+		lines = append(lines, post.Caption)
+	}
+	if mediaURL := strings.TrimSpace(msg.MediaURL); mediaURL != "" {
+		lines = append(lines, mediaURL)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// sharedPostCaptionHTML is the HTML form of sharedPostCaptionBody, with the
+// author in bold and the link labelled instead of shown in full.
+func sharedPostCaptionHTML(msg libtiktok.Message) string {
+	post := msg.SharedPost
+	heading := "TikTok post"
+	if post.AuthorName != "" {
+		heading = "<b>" + html.EscapeString(post.AuthorName) + "</b> on TikTok"
+	}
+	parts := []string{heading}
+	if post.Caption != "" {
+		parts = append(parts, event.TextToHTML(post.Caption))
+	}
+	if mediaURL := strings.TrimSpace(msg.MediaURL); mediaURL != "" {
+		parts = append(parts, `<a href="`+html.EscapeString(mediaURL)+`">Open on TikTok</a>`)
+	}
+	return strings.Join(parts, "<br>")
+}
+
+func sharedPostHeading(post *libtiktok.SharedPost) string {
+	if post.AuthorName == "" {
+		return "TikTok post"
+	}
+	return post.AuthorName + " on TikTok"
 }
 
 // convertUnknownMessage produces a fallback m.notice for message types that
